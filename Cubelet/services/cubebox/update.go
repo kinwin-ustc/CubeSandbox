@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/ttrpc"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/api/services/cubebox/v1"
@@ -168,10 +169,20 @@ func (s *service) UpdateWithPause(ctx context.Context, req *cubebox.UpdateCubeSa
 
 	doPreStop(ctx, sb.FirstContainer())
 
-	if err := task.Pause(ctx); err != nil {
-		rsp.Ret.RetMsg = err.Error()
+	// Give task.Pause an explicit timeout so it cannot be stretched out
+	// arbitrarily by the upstream ctx; otherwise, once the upstream ctx is
+	// cancelled the cubelet view stays stuck at PAUSING while cubeshim is
+	// already PAUSED.
+	pauseCtx, pauseCancel := context.WithTimeout(ctx, taskPauseTimeout)
+	defer pauseCancel()
+	if pauseErr := task.Pause(pauseCtx); pauseErr != nil {
+		// Even when ttrpc reports an error (DeadlineExceeded / canceled /
+		// ttrpc closed), cubeshim may have actually paused the VM. Query the
+		// real status once with an independent, ctx-immune short timeout and
+		// persist the truth, so the state never stays stuck at PAUSING.
+		reconcileStatusAfterPauseError(ctx, sb, task, pauseErr)
+		rsp.Ret.RetMsg = pauseErr.Error()
 		rsp.Ret.RetCode = errorcode.ErrorCode_TaskPauseFailed
-
 		return rsp, nil
 	}
 	for _, c := range sb.AllContainers() {
@@ -217,7 +228,13 @@ func (s *service) UpdateWithResume(ctx context.Context, req *cubebox.UpdateCubeS
 	}()
 	defer utils.Recover()
 
-	if err := task.Resume(ctx); err != nil {
+	resumeCtx, resumeCancel := context.WithTimeout(ctx, taskResumeTimeout)
+	defer resumeCancel()
+	if err := task.Resume(resumeCtx); err != nil {
+		// Same as pause: resume may time out midway while cubeshim has already
+		// brought the VM back to RUNNING. Query the real status once and
+		// converge to the truth, so the state never stays stuck at PAUSED.
+		reconcileStatusAfterResumeError(ctx, sb, task, err)
 		rsp.Ret.RetMsg = err.Error()
 		rsp.Ret.RetCode = errorcode.ErrorCode_TaskResumeFailed
 		return rsp, nil
@@ -239,4 +256,145 @@ func (s *service) UpdateWithResume(ctx context.Context, req *cubebox.UpdateCubeS
 		}
 	}
 	return rsp, nil
+}
+
+// Upper bound for the Pause/Resume ttrpc calls. 30s is used because cubeshim
+// pausing a VM involves vCPU stop + device quiesce + memory eventual
+// consistency, which is normally < 5s; 30s is a safety net to prevent the
+// call from being stuck indefinitely when the upstream ctx is missing or
+// blocked. Used together with the reconcile* error convergence.
+const (
+	taskPauseTimeout  = 30 * time.Second
+	taskResumeTimeout = 30 * time.Second
+
+	// Dedicated status-query timeout opened during reconcile. It MUST use a
+	// fresh ctx and never reuse the already-expired ctx.
+	reconcileStatusTimeout = 5 * time.Second
+)
+
+// reconcileStatusAfterPauseError, after task.Pause reports an error, actively
+// queries cubeshim once for the real task status and straightens the cubelet
+// in-memory view to the truth, so PausingAt never lingers forever. Note: all
+// status writes here must stay consistent with the UpdateWithPause success
+// path.
+func reconcileStatusAfterPauseError(
+	parentCtx context.Context,
+	sb *cubeboxstore.CubeBox,
+	task containerd.Task,
+	pauseErr error,
+) {
+	// Deliberately start a fresh ctx from Background: parentCtx is very likely
+	// already Done.
+	queryCtx, cancel := context.WithTimeout(context.Background(), reconcileStatusTimeout)
+	defer cancel()
+	// Carry over the original ns to avoid namespaces.NamespaceRequired failing.
+	if ns, ok := namespaces.Namespace(parentCtx); ok && ns != "" {
+		queryCtx = namespaces.WithNamespace(queryCtx, ns)
+	}
+
+	st, qerr := task.Status(queryCtx)
+	if qerr != nil {
+		// Cannot determine the real status, so do not write blindly. Keep
+		// PausingAt visible to operators and wait for the event-driven
+		// reconcile (/tasks/paused subscription) to back it up.
+		log.G(parentCtx).Errorf(
+			"reconcileStatusAfterPauseError: task.Status failed sandbox=%s pauseErr=%v statusErr=%v",
+			sb.ID, pauseErr, qerr)
+		return
+	}
+
+	switch st.Status {
+	case containerd.Paused:
+		// cubeshim actually succeeded -> write PausedAt as in the success path.
+		// Note: TaskPauseFailed is still returned to the upstream so it can
+		// alert; but the cubelet internal state is consistent with the real VM,
+		// and the next IsPaused() short-circuit becomes already-paused instead
+		// of staying stuck at PAUSING forever.
+		log.G(parentCtx).Warnf(
+			"reconcileStatusAfterPauseError: shim reports PAUSED despite pauseErr=%v, converging sandbox=%s",
+			pauseErr, sb.ID)
+		for _, c := range sb.AllContainers() {
+			if c.Status == nil {
+				continue
+			}
+			c.Status.Update(func(status cubeboxstore.Status) (cubeboxstore.Status, error) {
+				status.PausedAt = time.Now().UnixNano()
+				status.PausingAt = 0
+				return status, nil
+			})
+		}
+	case containerd.Running, containerd.Created:
+		// Really not paused -> reset PausingAt to avoid it lingering forever.
+		log.G(parentCtx).Warnf(
+			"reconcileStatusAfterPauseError: shim reports %s, rolling PausingAt back sandbox=%s pauseErr=%v",
+			st.Status, sb.ID, pauseErr)
+		for _, c := range sb.AllContainers() {
+			if c.Status == nil {
+				continue
+			}
+			c.Status.Update(func(status cubeboxstore.Status) (cubeboxstore.Status, error) {
+				status.PausingAt = 0
+				return status, nil
+			})
+		}
+	default:
+		// Intermediate states such as Stopped/Unknown/Pausing: leave the status
+		// untouched and let TaskExit / the event subscription handle them.
+		log.G(parentCtx).Warnf(
+			"reconcileStatusAfterPauseError: shim reports %s, leaving status untouched sandbox=%s",
+			st.Status, sb.ID)
+	}
+}
+
+// reconcileStatusAfterResumeError is the dual of the pause case.
+func reconcileStatusAfterResumeError(
+	parentCtx context.Context,
+	sb *cubeboxstore.CubeBox,
+	task containerd.Task,
+	resumeErr error,
+) {
+	queryCtx, cancel := context.WithTimeout(context.Background(), reconcileStatusTimeout)
+	defer cancel()
+	if ns, ok := namespaces.Namespace(parentCtx); ok && ns != "" {
+		queryCtx = namespaces.WithNamespace(queryCtx, ns)
+	}
+
+	st, qerr := task.Status(queryCtx)
+	if qerr != nil {
+		log.G(parentCtx).Errorf(
+			"reconcileStatusAfterResumeError: task.Status failed sandbox=%s resumeErr=%v statusErr=%v",
+			sb.ID, resumeErr, qerr)
+		return
+	}
+
+	switch st.Status {
+	case containerd.Running:
+		// The shim has actually resumed successfully; likewise invalidate the
+		// runtime snapshot bindings to stay consistent with the
+		// UpdateWithResume success path.
+		log.G(parentCtx).Warnf(
+			"reconcileStatusAfterResumeError: shim reports RUNNING despite resumeErr=%v, converging sandbox=%s",
+			resumeErr, sb.ID)
+		invalidateRuntimeSnapshotBindingsAfterOpaqueRestore(sb, time.Now().UTC())
+		for _, c := range sb.AllContainers() {
+			if c.Status == nil {
+				continue
+			}
+			c.Status.Update(func(status cubeboxstore.Status) (cubeboxstore.Status, error) {
+				status.PausedAt = 0
+				status.PausingAt = 0
+				return status, nil
+			})
+		}
+	case containerd.Paused:
+		// Really not resumed, the state stays PAUSED and needs no rewrite (the
+		// success path has not run yet).
+		log.G(parentCtx).Warnf(
+			"reconcileStatusAfterResumeError: shim still PAUSED resumeErr=%v sandbox=%s",
+			resumeErr, sb.ID)
+	default:
+		log.G(parentCtx).Warnf(
+			"reconcileStatusAfterResumeError: shim reports %s, leaving status untouched sandbox=%s",
+			st.Status, sb.ID)
+	}
 }
