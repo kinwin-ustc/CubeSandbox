@@ -874,8 +874,7 @@ func scanDeadContainer(ctx context.Context, dc []*cubeboxstore.CubeBox, client *
 		// Calling RecoverContainer -> shim state() while pause_vm() holds the
 		// sandbox mutex causes a ttrpc timeout; RecoverContainer then sets
 		// Unknown=true, making the sandbox appear Terminated and triggering a
-		// spurious Destroy cascade.  Skip paused/pausing sandboxes: DeadGC has
-		// nothing useful to do for them.
+		// spurious Destroy cascade.
 		//
 		// The same race exists for snapshot rollback: while updateShimForRollback
 		// runs, the shim holds its sandbox mutex doing delete_vm +
@@ -883,8 +882,33 @@ func scanDeadContainer(ctx context.Context, dc []*cubeboxstore.CubeBox, client *
 		// task status=Unknown. RollbackSandbox sets RollingBack on every
 		// container's Status before invoking the shim and clears it via defer,
 		// so DeadGC must respect the flag for the same reason.
-		if cb.GetStatus() != nil && (cb.GetStatus().IsPaused() || cb.GetStatus().Get().RollingBack) {
-			continue
+		if status := cb.GetStatus(); status != nil {
+			st := status.Get()
+			if st.RollingBack {
+				continue
+			}
+			switch st.State() {
+			case cubebox.ContainerState_CONTAINER_PAUSED:
+				// User-driven pause: a legitimate, possibly long-lived state.
+				// Nothing for DeadGC to do.
+				continue
+			case cubebox.ContainerState_CONTAINER_PAUSING:
+				// PAUSING is meant to be a short transient. While a pause is
+				// genuinely in flight the shim holds its sandbox mutex, so a
+				// state() query would time out and stamp Unknown=true (see
+				// above) -- within the safety window we still skip. Past
+				// pausingStuckThreshold the pause is no longer running (e.g. the
+				// cubelet restarted mid-pause and missed both the RPC and
+				// /tasks/paused reconcile windows); reconcile once against the
+				// shim's real status so the sandbox never stays stuck at PAUSING
+				// forever.
+				if st.PausingAt == 0 ||
+					time.Since(time.Unix(0, st.PausingAt)) < pausingStuckThreshold {
+					continue
+				}
+				reconcileStuckPausingSandbox(ctx, client, cb)
+				continue
+			}
 		}
 		ctx = namespaces.WithNamespace(ctx, cb.Namespace)
 		ctr, err := cubes.RecoverContainer(ctx, client, cb, cb.FirstContainer())

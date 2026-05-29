@@ -270,6 +270,17 @@ const (
 	// Dedicated status-query timeout opened during reconcile. It MUST use a
 	// fresh ctx and never reuse the already-expired ctx.
 	reconcileStatusTimeout = 5 * time.Second
+
+	// pausingStuckThreshold bounds how long a sandbox may legitimately remain
+	// in the PAUSING transient. A real pause completes well within
+	// taskPauseTimeout; once PausingAt is older than this -- e.g. the cubelet
+	// restarted mid-pause and missed both the RPC-level reconcile and the
+	// /tasks/paused event window -- the pause is no longer in flight and DeadGC
+	// may safely query the shim to converge. It MUST stay comfortably larger
+	// than taskPauseTimeout so an in-flight pause (during which the shim holds
+	// its sandbox mutex and a ttrpc state() query would time out) is never
+	// reconciled prematurely.
+	pausingStuckThreshold = 2 * taskPauseTimeout
 )
 
 // reconcileStatusAfterPauseError, after task.Pause reports an error, actively
@@ -303,16 +314,35 @@ func reconcileStatusAfterPauseError(
 		return
 	}
 
-	switch st.Status {
+	// Delegate to the shared converger so the PAUSE-direction rules cannot
+	// drift between this RPC-level path and the DeadGC stuck-PAUSING fallback.
+	// TaskPauseFailed is still returned to the upstream so it can alert; the
+	// in-memory view here is merely straightened to match the real VM.
+	convergePauseStateFromShim(parentCtx, sb, st.Status, fmt.Sprintf("pause RPC error: %v", pauseErr))
+}
+
+// convergePauseStateFromShim straightens PausingAt/PausedAt across every
+// container of the sandbox so the in-memory view matches the shim's real task
+// status. It is the single source of truth for the PAUSE-direction
+// convergence rules, shared by reconcileStatusAfterPauseError (RPC path) and
+// reconcileStuckPausingSandbox (DeadGC fallback) so the two can never drift.
+// It never writes Unknown=true, so background scanners can use it without
+// risking a spurious Terminated/Destroy cascade. reason only adds logging
+// context.
+func convergePauseStateFromShim(
+	ctx context.Context,
+	sb *cubeboxstore.CubeBox,
+	shimStatus containerd.ProcessStatus,
+	reason string,
+) {
+	switch shimStatus {
 	case containerd.Paused:
-		// cubeshim actually succeeded -> write PausedAt as in the success path.
-		// Note: TaskPauseFailed is still returned to the upstream so it can
-		// alert; but the cubelet internal state is consistent with the real VM,
-		// and the next IsPaused() short-circuit becomes already-paused instead
-		// of staying stuck at PAUSING forever.
-		log.G(parentCtx).Warnf(
-			"reconcileStatusAfterPauseError: shim reports PAUSED despite pauseErr=%v, converging sandbox=%s",
-			pauseErr, sb.ID)
+		// cubeshim actually reached PAUSED -> write PausedAt exactly as the
+		// UpdateWithPause success path does, so the next IsPaused() check sees
+		// already-paused instead of staying stuck at PAUSING forever.
+		log.G(ctx).Warnf(
+			"convergePauseStateFromShim: shim reports PAUSED, converging to PAUSED sandbox=%s reason=%s",
+			sb.ID, reason)
 		for _, c := range sb.AllContainers() {
 			if c.Status == nil {
 				continue
@@ -324,10 +354,10 @@ func reconcileStatusAfterPauseError(
 			})
 		}
 	case containerd.Running, containerd.Created:
-		// Really not paused -> reset PausingAt to avoid it lingering forever.
-		log.G(parentCtx).Warnf(
-			"reconcileStatusAfterPauseError: shim reports %s, rolling PausingAt back sandbox=%s pauseErr=%v",
-			st.Status, sb.ID, pauseErr)
+		// Really not paused -> clear PausingAt so it cannot linger forever.
+		log.G(ctx).Warnf(
+			"convergePauseStateFromShim: shim reports %s, clearing PausingAt sandbox=%s reason=%s",
+			shimStatus, sb.ID, reason)
 		for _, c := range sb.AllContainers() {
 			if c.Status == nil {
 				continue
@@ -340,9 +370,9 @@ func reconcileStatusAfterPauseError(
 	default:
 		// Intermediate states such as Stopped/Unknown/Pausing: leave the status
 		// untouched and let TaskExit / the event subscription handle them.
-		log.G(parentCtx).Warnf(
-			"reconcileStatusAfterPauseError: shim reports %s, leaving status untouched sandbox=%s",
-			st.Status, sb.ID)
+		log.G(ctx).Warnf(
+			"convergePauseStateFromShim: shim reports %s, leaving status untouched sandbox=%s reason=%s",
+			shimStatus, sb.ID, reason)
 	}
 }
 
@@ -397,4 +427,62 @@ func reconcileStatusAfterResumeError(
 			"reconcileStatusAfterResumeError: shim reports %s, leaving status untouched sandbox=%s",
 			st.Status, sb.ID)
 	}
+}
+
+// reconcileStuckPausingSandbox is the startup/background fallback -- the third
+// line of defense for the PAUSING state behind reconcileStatusAfterPauseError
+// (RPC path) and the /tasks/paused event subscription (events.go). If the
+// cubelet crashes or restarts while a pause is in flight, neither of those
+// fires again (events are not replayed, the RPC caller is gone), so without
+// this a sandbox could stay stuck at PAUSING forever: DeadGC otherwise skips
+// paused/pausing sandboxes outright.
+//
+// The caller (DeadGC) MUST only invoke this once PausingAt has lingered past
+// pausingStuckThreshold, i.e. long after any genuine in-flight pause would
+// have released the shim's sandbox mutex, so the ttrpc status query below
+// cannot race it. Unlike cubes.RecoverContainer it never stamps Unknown=true,
+// so it cannot trigger a spurious Terminated/Destroy cascade.
+func reconcileStuckPausingSandbox(ctx context.Context, client *containerd.Client, cb *cubeboxstore.CubeBox) {
+	fc := cb.FirstContainer()
+	if fc == nil {
+		return
+	}
+	ns := cb.Namespace
+	if ns == "" {
+		ns = namespaces.Default
+	}
+	queryCtx, cancel := context.WithTimeout(context.Background(), reconcileStatusTimeout)
+	defer cancel()
+	queryCtx = namespaces.WithNamespace(queryCtx, ns)
+
+	cntr := fc.Container
+	if cntr == nil {
+		loaded, err := client.LoadContainer(queryCtx, fc.ID)
+		if err != nil {
+			log.G(ctx).Errorf(
+				"reconcileStuckPausingSandbox: load container %s failed sandbox=%s err=%v",
+				fc.ID, cb.ID, err)
+			return
+		}
+		cntr = loaded
+	}
+	task, err := cntr.Task(queryCtx, nil)
+	if err != nil {
+		log.G(ctx).Errorf(
+			"reconcileStuckPausingSandbox: load task failed sandbox=%s err=%v", cb.ID, err)
+		return
+	}
+	st, err := task.Status(queryCtx)
+	if err != nil {
+		log.G(ctx).Errorf(
+			"reconcileStuckPausingSandbox: task.Status failed sandbox=%s err=%v", cb.ID, err)
+		return
+	}
+
+	stuckFor := time.Duration(0)
+	if pausingAt := cb.GetStatus().Get().PausingAt; pausingAt != 0 {
+		stuckFor = time.Since(time.Unix(0, pausingAt))
+	}
+	convergePauseStateFromShim(ctx, cb, st.Status,
+		fmt.Sprintf("DeadGC stuck PAUSING for %s", stuckFor))
 }
